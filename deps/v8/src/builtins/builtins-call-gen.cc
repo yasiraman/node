@@ -497,7 +497,7 @@ void CallOrConstructBuiltinsAssembler::CallReceiver(
   auto target = Parameter<Object>(Descriptor::kFunction);
   auto context = LoadContextFromBaseline();
   auto feedback_vector = LoadFeedbackVectorFromBaseline();
-  LazyNode<Object> receiver = [=] {
+  LazyNode<Object> receiver = [=, this] {
     if (maybe_receiver) {
       return *maybe_receiver;
     } else {
@@ -638,7 +638,7 @@ TNode<JSReceiver> CallOrConstructBuiltinsAssembler::GetCompatibleReceiver(
           LoadObjectField<SharedFunctionInfo>(
               var_template.value(), JSFunction::kSharedFunctionInfoOffset);
       TNode<Object> template_data =
-          LoadSharedFunctionInfoFunctionData(template_shared);
+          LoadSharedFunctionInfoUntrustedFunctionData(template_shared);
       GotoIf(TaggedIsSmi(template_data), &holder_next);
       var_template = CAST(template_data);
       Goto(&template_loop);
@@ -801,7 +801,7 @@ void CallOrConstructBuiltinsAssembler::CallFunctionTemplate(
       TailCallBuiltin(Builtin::kCallApiCallbackOptimized, context,
                       callback_address,
                       TruncateIntPtrToInt32(args.GetLengthWithoutReceiver()),
-                      callback_data, holder);
+                      function_template_info, holder);
       break;
     }
   }
@@ -880,7 +880,7 @@ TF_BUILTIN(HandleApiCallOrConstruct, CallOrConstructBuiltinsAssembler) {
     TNode<SharedFunctionInfo> shared =
         LoadJSFunctionSharedFunctionInfo(CAST(target));
     TNode<FunctionTemplateInfo> function_template_info =
-        CAST(LoadSharedFunctionInfoFunctionData(shared));
+        CAST(LoadSharedFunctionInfoUntrustedFunctionData(shared));
 
     // The topmost script-having context is not guaranteed to be equal to
     // current context at this point. For example, if target function was

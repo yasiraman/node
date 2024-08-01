@@ -17,11 +17,12 @@ build_with_node = false
 # chromium build.
 perfetto_build_with_embedder = true
 
-# When embedding perfetto, its build files need to know in which BUILD.gn file
-# the embedder (v8) declared the protobuf targets. In the v8 case they are
-# declared in the root v8/BUILD.gn.
-perfetto_protobuf_target_prefix = "//"
-perfetto_protobuf_gni = "//gni/proto_library.gni"
+# TODO(https://crbug.com/337736622): These variables are now no-ops.
+# Remove them after removing downstream usage.
+protobuf_target_prefix = "//third_party/protobuf/"
+perfetto_protobuf_target_prefix = protobuf_target_prefix
+perfetto_protobuf_gni = "//third_party/protobuf/proto_library.gni"
+perfetto_protobuf_src_dir = "//third_party/protobuf/src"
 
 # We use Perfetto's Trace Processor to convert traces to the legacy JSON
 # format.

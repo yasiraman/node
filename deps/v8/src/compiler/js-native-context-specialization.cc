@@ -175,7 +175,7 @@ Reduction JSNativeContextSpecialization::ReduceJSToString(Node* node) {
   // regressions and the stronger optimization should be re-implemented.
   NumberMatcher number_matcher(input);
   if (number_matcher.HasResolvedValue()) {
-    Handle<Object> num_obj =
+    DirectHandle<Object> num_obj =
         broker()
             ->local_isolate_or_isolate()
             ->factory()
@@ -200,7 +200,7 @@ Handle<String> JSNativeContextSpecialization::CreateStringConstant(Node* node) {
   DCHECK(IrOpcode::IsConstantOpcode(node->opcode()));
   NumberMatcher number_matcher(node);
   if (number_matcher.HasResolvedValue()) {
-    Handle<Object> num_obj =
+    DirectHandle<Object> num_obj =
         broker()
             ->local_isolate_or_isolate()
             ->factory()
@@ -2227,6 +2227,18 @@ Reduction JSNativeContextSpecialization::ReduceElementAccess(
     }
   }
 
+  // Do not optimize Float16 typed arrays, since they are not yet supported by
+  // the rest of the compiler.
+  // TODO(v8:14012): We could lower further here and emit LoadTypedElement (like
+  // we do for other typed arrays). However, given the lack of hardware support
+  // for Float16 operations, it's not clear whether optimizing further would be
+  // really useful.
+  for (const ElementAccessInfo& access_info : access_infos) {
+    if (IsFloat16TypedArrayElementsKind(access_info.elements_kind())) {
+      return NoChange();
+    }
+  }
+
   // For holey stores or growing stores, we need to check that the prototype
   // chain contains no setters for elements, and we need to guard those checks
   // via code dependencies on the relevant prototype maps.
@@ -2594,6 +2606,39 @@ Reduction JSNativeContextSpecialization::ReduceJSLoadPropertyWithEnumeratedKey(
   // TurboFan cannot prove that there is no observable side effect between
   // the {JSForInNext} and the {JSLoadProperty} node.
   //
+  // We can do a similar optimization when the receiver of {JSLoadProperty} is
+  // not identical to the receiver of {JSForInNext}:
+  //   for (name in receiver) {
+  //     value = object[name];
+  //     ...
+  //   }
+  //
+  // This is because when the key is {JSForInNext}, we will generate a
+  // {GetEnumeratedKeyedProperty} bytecode for {JSLoadProperty}. If the bytecode
+  // always manages to use the enum cache, we will keep the inline cache in
+  // uninitialized state. So If the graph is as below, we can firstly do a map
+  // check on {object} and then turn the {JSLoadProperty} into the
+  // {LoadFieldByIndex}. This is also safe when the bytecode has never been
+  // profiled. When it happens to pass the the map check, we can use the fast
+  // path. Otherwise it will trigger a deoptimization.
+
+  // object     receiver
+  //  ^             ^
+  //  |             |
+  //  |             |
+  //  |             |
+  //  |        JSToObject
+  //  |             ^
+  //  |             |
+  //  |             |
+  //  |        JSForInNext
+  //  |             ^
+  //  |             |
+  //  +----+  +-----+
+  //       |  |
+  //       |  |
+  //   JSLoadProperty (insufficient feedback)
+
   // Also note that it's safe to look through the {JSToObject}, since the
   // [[Get]] operation does an implicit ToObject anyway, and these operations
   // are not observable.
@@ -2614,11 +2659,32 @@ Reduction JSNativeContextSpecialization::ReduceJSLoadPropertyWithEnumeratedKey(
   if (object->opcode() == IrOpcode::kJSToObject) {
     object = NodeProperties::GetValueInput(object, 0);
   }
-  if (object != receiver) return NoChange();
+  bool speculating_object_is_receiver = false;
+  if (object != receiver) {
+    JSLoadPropertyNode n(node);
+    PropertyAccess const& p = n.Parameters();
+
+    ProcessedFeedback const& feedback = broker()->GetFeedbackForPropertyAccess(
+        FeedbackSource(p.feedback()), AccessMode::kLoad, base::nullopt);
+    // When the feedback is uninitialized, it is either a load from a
+    // {GetEnumeratedKeyedProperty} which always hits the enum cache, or a keyed
+    // load that had never been reached. In either case, we can check the map
+    // of the receiver and use the enum cache if the map match the {cache_type}.
+    if (feedback.kind() != ProcessedFeedback::kInsufficient) {
+      return NoChange();
+    }
+
+    // Ensure that {receiver} is a HeapObject.
+    effect = graph()->NewNode(simplified()->CheckHeapObject(), receiver, effect,
+                              control);
+    speculating_object_is_receiver = true;
+  }
 
   // No need to repeat the map check if we can prove that there's no
-  // observable side effect between {effect} and {name].
-  if (!NodeProperties::NoObservableSideEffectBetween(effect, name)) {
+  // observable side effect between {effect} and {name]. But we always need a
+  // map check when {object} is not identical to {receiver}.
+  if (!NodeProperties::NoObservableSideEffectBetween(effect, name) ||
+      speculating_object_is_receiver) {
     // Check that the {receiver} map is still valid.
     Node* receiver_map = effect =
         graph()->NewNode(simplified()->LoadField(AccessBuilder::ForMap()),
@@ -2787,7 +2853,10 @@ Node* JSNativeContextSpecialization::InlineApiCall(
     FunctionTemplateInfoRef function_template_info) {
   compiler::OptionalObjectRef maybe_callback_data =
       function_template_info.callback_data(broker());
+  // Check if the function has an associated C++ code to execute.
   if (!maybe_callback_data.has_value()) {
+    // TODO(ishell): consider generating "return undefined" for empty function
+    // instead of failing.
     TRACE_BROKER_MISSING(broker(), "call code for function template info "
                                        << function_template_info);
     return nullptr;
@@ -2808,7 +2877,8 @@ Node* JSNativeContextSpecialization::InlineApiCall(
           1 /* implicit receiver */,
       CallDescriptor::kNeedsFrameState);
 
-  Node* data = jsgraph()->ConstantNoHole(maybe_callback_data.value(), broker());
+  Node* func_templ =
+      jsgraph()->HeapConstantNoHole(function_template_info.object());
   ApiFunction function(function_template_info.callback(broker()));
   Node* function_reference =
       graph()->NewNode(common()->ExternalConstant(ExternalReference::Create(
@@ -2817,8 +2887,9 @@ Node* JSNativeContextSpecialization::InlineApiCall(
 
   // Add CallApiCallbackStub's register argument as well.
   Node* context = jsgraph()->ConstantNoHole(native_context(), broker());
-  Node* inputs[11] = {code, function_reference, jsgraph()->ConstantNoHole(argc),
-                      data, api_holder,         receiver};
+  Node* inputs[11] = {
+      code,       function_reference, jsgraph()->ConstantNoHole(argc),
+      func_templ, api_holder,         receiver};
   int index = 6 + argc;
   inputs[index++] = context;
   inputs[index++] = frame_state;
@@ -3066,12 +3137,14 @@ JSNativeContextSpecialization::BuildPropertyStore(
       case MachineRepresentation::kBit:
       case MachineRepresentation::kCompressedPointer:
       case MachineRepresentation::kCompressed:
+      case MachineRepresentation::kProtectedPointer:
       case MachineRepresentation::kIndirectPointer:
       case MachineRepresentation::kSandboxedPointer:
       case MachineRepresentation::kWord8:
       case MachineRepresentation::kWord16:
       case MachineRepresentation::kWord32:
       case MachineRepresentation::kWord64:
+      case MachineRepresentation::kFloat16:
       case MachineRepresentation::kFloat32:
       case MachineRepresentation::kSimd128:
       case MachineRepresentation::kSimd256:
@@ -3172,24 +3245,6 @@ Reduction JSNativeContextSpecialization::ReduceJSToObject(Node* node) {
   ReplaceWithValue(node, receiver, effect);
   return Replace(receiver);
 }
-
-namespace {
-
-ExternalArrayType GetArrayTypeFromElementsKind(ElementsKind kind) {
-  switch (kind) {
-#define TYPED_ARRAY_CASE(Type, type, TYPE, ctype) \
-  case TYPE##_ELEMENTS:                           \
-  case RAB_GSAB_##TYPE##_ELEMENTS:                \
-    return kExternal##Type##Array;
-    TYPED_ARRAYS(TYPED_ARRAY_CASE)
-#undef TYPED_ARRAY_CASE
-    default:
-      break;
-  }
-  UNREACHABLE();
-}
-
-}  // namespace
 
 JSNativeContextSpecialization::ValueEffectControl
 JSNativeContextSpecialization::BuildElementAccess(
@@ -3725,6 +3780,7 @@ JSNativeContextSpecialization::
   // Access the actual element.
   ExternalArrayType external_array_type =
       GetArrayTypeFromElementsKind(elements_kind);
+  DCHECK_NE(external_array_type, ExternalArrayType::kExternalFloat16Array);
   switch (keyed_mode.access_mode()) {
     case AccessMode::kLoad: {
       // Check if we can return undefined for out-of-bounds loads.
